@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+uploads/
+uploaded_videos/
+deepfake_model_best*.pth

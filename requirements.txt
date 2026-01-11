@@ -1,0 +1,18 @@
+# This project requires Python 3.11+
+python==3.11.6
+fastapi
+uvicorn[standard]
+python-multipart
+torch
+torchvision
+opencv-python
+pillow
+decord
+mediapipe
+numpy
+scipy
+scikit-learn
+tqdm
+timm
+requests
+Pillow

@@ -1,14 +1,14 @@
-import os
 import glob
-from typing import List, Tuple
+import os
+from pathlib import Path
 
+import timm
 import torch
 import torch.nn as nn
 from PIL import Image
 from torchvision import transforms
-import timm
 
-# Attention Module
+
 class Attention(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
@@ -21,25 +21,23 @@ class Attention(nn.Module):
         q = self.query(x)
         k = self.key(x)
         v = self.value(x)
-        attn = self.softmax(torch.matmul(q, k.transpose(-2, -1)) / (x.size(-1) ** 0.5))
-        return torch.matmul(attn, v)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (x.size(-1) ** 0.5)
+        return torch.matmul(self.softmax(scores), v)
 
 
-# Model Architecture
 class DeepfakeFinal(nn.Module):
+    """EfficientNet-B3 + BiLSTM + temporal self-attention classifier."""
+
     def __init__(self) -> None:
         super().__init__()
-        # returns features when num_classes=0
-        self.backbone = timm.create_model("efficientnet_b3", pretrained=True, num_classes=0)
-
-        # Unfreeze last 4 stages
-        for name, param in self.backbone.named_parameters():
-            if any(x in name for x in ["blocks.3", "blocks.4", "blocks.5", "blocks.6"]):
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-
-        self.lstm = nn.LSTM(1536, 512, batch_first=True, bidirectional=True)
+        # The checkpoint contains the complete backbone, so do not download
+        # ImageNet weights during API startup.
+        self.backbone = timm.create_model(
+            "efficientnet_b3", pretrained=False, num_classes=0
+        )
+        self.lstm = nn.LSTM(
+            1536, 512, batch_first=True, bidirectional=True
+        )
         self.attention = Attention(1024)
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
@@ -49,48 +47,88 @@ class DeepfakeFinal(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, t, c, h, w = x.shape
-        x = x.view(b * t, c, h, w)
+        batch, frames, channels, height, width = x.shape
+        x = x.reshape(batch * frames, channels, height, width)
         x = self.backbone(x)
-        x = x.view(b, t, -1)
+        x = x.reshape(batch, frames, -1)
         x, _ = self.lstm(x)
         x = self.attention(x)
         x = x.mean(dim=1)
         return self.fc(x)
 
 
-val_transform = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-])
+VAL_TRANSFORM = transforms.Compose(
+    [
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            [0.485, 0.456, 0.406],
+            [0.229, 0.224, 0.225],
+        ),
+    ]
+)
+
 
 def load_model(weights_path: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DeepfakeFinal().to(device).eval()
-    state = torch.load(weights_path, map_location=device)
-    model.load_state_dict(state, strict=False)  # ✅ CHANGED: Added strict=False
+    path = Path(weights_path).expanduser().resolve()
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Model weights not found: {path}")
+
+    model = DeepfakeFinal().to(device)
+    state = torch.load(path, map_location=device, weights_only=True)
+    if not isinstance(state, dict):
+        raise RuntimeError("Checkpoint does not contain a model state_dict")
+
+    # Fail loudly if the checkpoint was produced by a different architecture.
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint/model architecture mismatch. "
+            f"Missing keys: {missing[:5]} | Unexpected keys: {unexpected[:5]}"
+        )
+
+    model.eval()
     return model, device
+
 
 def build_clip_from_dir(frames_dir: str, num_frames: int = 16):
     paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
     if not paths:
-        raise ValueError("No frames found")
-    step = max(1, len(paths) // num_frames)
-    idxs = list(range(0, len(paths), step))[:num_frames]
-    imgs = [val_transform(Image.open(paths[i]).convert("RGB")) for i in idxs]
-    if len(imgs) < num_frames:
-        imgs += [imgs[-1]] * (num_frames - len(imgs))
-    clip = torch.stack(imgs, dim=0).unsqueeze(0)  # (1,T,C,H,W)
-    picked = [os.path.basename(paths[i]) for i in idxs]
+        raise ValueError("No extracted frames found")
+
+    # Match the training convention: evenly sample the complete sequence.
+    if len(paths) <= num_frames:
+        indices = list(range(len(paths)))
+    else:
+        indices = torch.linspace(0, len(paths) - 1, num_frames).long().tolist()
+
+    images = [
+        VAL_TRANSFORM(Image.open(paths[index]).convert("RGB"))
+        for index in indices
+    ]
+
+    if len(images) < num_frames:
+        images.extend([images[-1]] * (num_frames - len(images)))
+
+    clip = torch.stack(images).unsqueeze(0)
+    picked = [os.path.basename(paths[index]) for index in indices]
     return clip, picked
+
 
 def predict_from_frames_dir(model, device, frames_dir: str):
     x, picked = build_clip_from_dir(frames_dir)
     x = x.to(device)
-    with torch.no_grad():
+
+    with torch.inference_mode():
         logits = model(x)
         probs = torch.softmax(logits, dim=1).squeeze(0).cpu().tolist()
         pred = int(torch.argmax(logits, dim=1).item())
-    return {"pred": pred, "probs": probs, "pickedFrames": picked}
+
+    return {
+        "pred": pred,
+        "probs": probs,
+        "pickedFrames": picked,
+    }

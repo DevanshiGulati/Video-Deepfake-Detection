@@ -30,8 +30,8 @@ class DeepfakeFinal(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        # The checkpoint contains the complete backbone, so do not download
-        # ImageNet weights during API startup.
+        # Checkpoints contain the complete backbone, so no ImageNet download is
+        # needed during inference.
         self.backbone = timm.create_model(
             "efficientnet_b3", pretrained=False, num_classes=0
         )
@@ -70,6 +70,18 @@ VAL_TRANSFORM = transforms.Compose(
 )
 
 
+def _normalize_checkpoint_keys(state: dict) -> dict:
+    """Normalize legacy checkpoint naming to the canonical inference model."""
+    normalized = {}
+    for key, value in state.items():
+        # training_example.py saved the attention module as ``attn``.
+        # The canonical inference model uses ``attention``.
+        if key.startswith("attn."):
+            key = "attention." + key[len("attn."):]
+        normalized[key] = value
+    return normalized
+
+
 def load_model(weights_path: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     path = Path(weights_path).expanduser().resolve()
@@ -82,7 +94,7 @@ def load_model(weights_path: str):
     if not isinstance(state, dict):
         raise RuntimeError("Checkpoint does not contain a model state_dict")
 
-    # Fail loudly if the checkpoint was produced by a different architecture.
+    state = _normalize_checkpoint_keys(state)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         raise RuntimeError(

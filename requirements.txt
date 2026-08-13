@@ -1,5 +1,4 @@
-# This project requires Python 3.11+
-python==3.11.6
+# Python runtime: 3.11+ (install Python separately; pip cannot install Python itself)
 fastapi
 uvicorn[standard]
 python-multipart
@@ -15,4 +14,3 @@ scikit-learn
 tqdm
 timm
 requests
-Pillow
